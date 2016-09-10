@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/PuerkitoBio/purell"
 	"golang.org/x/net/html"
 )
 
@@ -64,17 +65,17 @@ func handleLink(domainURL url.URL, pageLink string, token html.Token) {
 		return
 	}
 
-	if isSameDomain(*linkURL, domainURL) != true { // Mismatching domains. Break.
+	if !isSameDomain(*linkURL, domainURL) { // Mismatching domains. Break.
 		appendResource(pageLink, "link", href)
 
 		return
 	}
 
-	resolved := strings.TrimSuffix(domainURL.ResolveReference(linkURL).String(), "/")
+	resolved := purell.NormalizeURL(domainURL.ResolveReference(linkURL), purell.FlagsSafe)
 
 	appendResource(pageLink, "link", resolved)
 
-	if _, ok := sitemap[resolved]; ok == false {
+	if _, ok := sitemap[resolved]; !ok {
 		// println(resolved)
 		findLinks(resolved) // A new link! Crawl it.
 	}
