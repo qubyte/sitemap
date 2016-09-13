@@ -1,30 +1,20 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
-	"net/http"
+	"log"
 	"net/url"
 	"strings"
-
-	"github.com/PuerkitoBio/purell"
-	"golang.org/x/net/html"
+	"sync"
 )
 
-// sitemap = {
-//   https://qubyte.codes: {
-//     link: {
-//       https://qubyte.codes: true
-//     },
-//     script: {
-//       ...
-//     }
-//   }
-// }
-var sitemap = make(map[string]map[string]map[string]bool)
+var waiting = 0
 
-// Determines if a link belongs to a domain.
-func isSameDomain(linkURL, domainURL url.URL) bool {
+// isSameDomain is a crude check that a given linkURL is in the same domain or a
+// subdomain of domainURL.
+func isSameDomain(linkURL, domainURL *url.URL) bool {
 	// Relative links are for the same domain.
 	if linkURL.Host == "" {
 		return true
@@ -36,173 +26,104 @@ func isSameDomain(linkURL, domainURL url.URL) bool {
 
 	// Links to subdomains of this domain still count.
 	if strings.HasSuffix(linkURL.Host, "."+domainURL.Host) {
+		log.Println("SUBDOMAIN:", linkURL.Host)
 		return true
 	}
 
 	return false
 }
 
-func findAttribute(token html.Token, attributeName string) string {
-	for _, a := range token.Attr {
-		if a.Key == attributeName { // Haven't found the href yet... Continue.
-			return a.Val
-		}
-	}
+// worker accepts URLs through a channel, makes a Site instance using it, and
+// adds the site to the sitemap. The Site instance is then instructed to crawl,
+// and links it discovers are pushed into another channel. Decrements the
+// WaitGroup when a site has been crawled.
+func worker(id int, startDomain *url.URL, sitemap *SiteMap, wg *sync.WaitGroup, queue chan *Site) {
+	for s := range queue {
+		s.Crawl()
 
-	return ""
-}
-
-func handleLink(domainURL url.URL, pageLink string, token html.Token) {
-	href := findAttribute(token, "href")
-
-	if href == "" {
-		return
-	}
-
-	linkURL, err := url.Parse(href)
-
-	if err != nil {
-		return
-	}
-
-	if !isSameDomain(*linkURL, domainURL) { // Mismatching domains. Break.
-		appendResource(pageLink, "link", href)
-
-		return
-	}
-
-	resolved := purell.NormalizeURL(domainURL.ResolveReference(linkURL), purell.FlagsSafe)
-
-	appendResource(pageLink, "link", resolved)
-
-	if _, ok := sitemap[resolved]; !ok {
-		// println(resolved)
-		findLinks(resolved) // A new link! Crawl it.
-	}
-
-	return
-}
-
-func handleScript(domainURL url.URL, pageLink string, token html.Token) {
-	src := findAttribute(token, "src")
-
-	if src == "" {
-		return
-	}
-
-	linkURL, err := url.Parse(src)
-
-	if err != nil {
-		return
-	}
-
-	resolved := domainURL.ResolveReference(linkURL).String()
-
-	appendResource(pageLink, "script", resolved)
-}
-
-func handleImage(domainURL url.URL, pageLink string, token html.Token) {
-	src := findAttribute(token, "src")
-
-	if src == "" {
-		return
-	}
-
-	linkURL, err := url.Parse(src)
-
-	if err != nil {
-		return
-	}
-
-	resolved := domainURL.ResolveReference(linkURL).String()
-
-	appendResource(pageLink, "image", resolved)
-}
-
-func appendResource(page, resourceType, resource string) {
-	if _, ok := sitemap[page][resourceType]; ok == false {
-		sitemap[page][resourceType] = make(map[string]bool)
-	}
-
-	sitemap[page][resourceType][resource] = true
-}
-
-// Consumes and tokenizes an HTTP response body.
-func findLinks(pageLink string) {
-	domainURL, err := url.Parse(pageLink)
-
-	if err != nil {
-		return
-	}
-
-	if domainURL.IsAbs() == false {
-		return
-	}
-
-	sitemap[pageLink] = make(map[string]map[string]bool)
-
-	res, err := http.Get(pageLink)
-
-	if err != nil {
-		return
-	}
-
-	defer res.Body.Close()
-
-	reader := html.NewTokenizer(res.Body)
-
-	for {
-		tt := reader.Next()
-
-		switch {
-		case tt == html.ErrorToken:
-			return
-
-		case tt == html.StartTagToken:
-			token := reader.Token()
-
-			switch {
-			case token.Data == "a":
-				handleLink(*domainURL, pageLink, token)
-				break
-
-			case token.Data == "script":
-				handleScript(*domainURL, pageLink, token)
-				break
-
-			case token.Data == "img":
-				handleImage(*domainURL, pageLink, token)
-				break
+		// Find new links within this domain for the crawled site, and add them to the queue.
+		for _, u := range s.Links {
+			if !isSameDomain(&u, startDomain) {
+				continue
 			}
-		}
-	}
-}
 
-func printSiteMap() {
-	for key := range sitemap {
-		fmt.Println(key)
+			site := Site{URL: u}
 
-		for resourceType, resources := range sitemap[key] {
-			fmt.Println("\t", resourceType)
+			wasSet := sitemap.SetOnce(&site)
 
-			for resource := range resources {
-				fmt.Println("\t\t", resource)
+			if !wasSet {
+				continue
 			}
+
+			wg.Add(1)
+
+			go func() {
+				queue <- &site
+			}()
 		}
+
+		wg.Done()
 	}
 }
 
-func main() {
+func checkFlags() (*url.URL, int) {
 	domain := flag.String("domain", "", "A fully qualified URL for the domain to crawl.")
+	jobs := flag.Int("jobs", 1, "Number of simultaneous requests to allow.")
 	flag.Parse()
 
 	if *domain == "" {
-		fmt.Println("A domain to crawl is required.")
+		log.Fatalln("A domain to crawl is required.")
 	}
 
-	fmt.Printf("Domain: %s\n", *domain)
+	if *jobs < 1 {
+		log.Fatal("The job count cannot be less than 1.")
+	}
 
-	findLinks(*domain)
+	linkURL, err := url.Parse(*domain)
 
-	printSiteMap()
+	if err != nil || !linkURL.IsAbs() {
+		log.Fatal("domain must be a fully qualified URL.")
+	}
+
+	return linkURL, *jobs
+}
+
+func main() {
+	linkURL, jobs := checkFlags()
+
+	log.Println("Domain:", linkURL.String())
+	log.Println("Workers:", jobs)
+
+	// Sites to crawl will be pushed into this stream.
+	sites := make(chan *Site, jobs)
+
+	// The number of pages to crawl is initially unknown, so a WaitGroup is used
+	// to block the completion of main until the WaitGroup is empty.
+	var wg sync.WaitGroup
+
+	sitemap := NewSiteMap()
+
+	// Start a bunch of workers.
+	for w := 0; w < jobs; w++ {
+		go worker(w, linkURL, sitemap, &wg, sites)
+	}
+
+	// Since we don't know how large a sitemap will be, we use a WaitGroup. Each
+	// new site to crawl will increment it, and once crawled will decrement it.
+	// Start the site crawl by incrementing and pushing the given domain into
+	// the sites channel.
+	wg.Add(1)
+
+	site := Site{URL: *linkURL}
+	sitemap.SetOnce(&site)
+	sites <- &site
+
+	// Wait until there are no sites left to crawl.
+	wg.Wait()
+
+	close(sites)
+
+	result, _ := json.Marshal(sitemap)
+
+	fmt.Println(string(result))
 }
