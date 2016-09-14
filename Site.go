@@ -2,49 +2,11 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/url"
 
 	"golang.org/x/net/html"
-
-	"github.com/PuerkitoBio/purell"
 )
-
-type normalizeError struct {
-	link string
-}
-
-func (e normalizeError) Error() string {
-	return fmt.Sprintf("Link could not be parsed and normalized: %s", e.link)
-}
-
-// parseAndNormalizeLinkAttribute searches for an attribute by name in a Token,
-// which is then parsed, resolved against the given origin (for relative URLs)
-// and normalized.
-func parseAndNormalizeLinkAttribute(origin *url.URL, token *html.Token, attributeName string) (*url.URL, error) {
-	link := ""
-
-	for _, a := range token.Attr {
-		if a.Key == attributeName {
-			link = a.Val
-		}
-	}
-
-	var u url.URL
-
-	if link == "" {
-		return &u, normalizeError{link}
-	}
-
-	linkURL, err := url.Parse(link)
-
-	if err != nil {
-		return &u, normalizeError{link}
-	}
-
-	return url.Parse(purell.NormalizeURL(origin.ResolveReference(linkURL), purell.FlagsSafe))
-}
 
 // Site contains information about a site, including its URL, and the URLs of
 // other sites it links to, scripts, and images.
@@ -54,6 +16,9 @@ type Site struct {
 	NoFollowLinks []url.URL
 	Scripts       []url.URL
 	Images        []url.URL
+	Videos        []url.URL
+	Audio         []url.URL
+	CSS           []url.URL
 }
 
 // urlsToStrings takes a list or URL instances and returns a list of URL strings
@@ -77,22 +42,18 @@ func (s *Site) MarshalJSON() ([]byte, error) {
 		Links   []string `json:"links"`
 		Scripts []string `json:"scripts"`
 		Images  []string `json:"images"`
+		Videos  []string `json:"videos"`
+		Audio   []string `json:"audio"`
+		CSS     []string `json:"css"`
 	}{
 		URL:     s.URL.String(),
 		Links:   links,
 		Scripts: *urlsToStrings(&s.Scripts),
 		Images:  *urlsToStrings(&s.Images),
+		Videos:  *urlsToStrings(&s.Videos),
+		Audio:   *urlsToStrings(&s.Audio),
+		CSS:     *urlsToStrings(&s.CSS),
 	})
-}
-
-func follow(token *html.Token) bool {
-	for _, a := range token.Attr {
-		if a.Key == "rel" && a.Val == "nofollow" {
-			return false
-		}
-	}
-
-	return true
 }
 
 // Crawl populates the resources of this Site instance by loading the associated
@@ -109,23 +70,67 @@ func (s *Site) Crawl() {
 
 	reader := html.NewTokenizer(res.Body)
 
+	openMediaTags := []string{}
+
 	for {
 		tt := reader.Next()
 
-		switch {
+		switch tt {
 
 		// The document has been read to the end. Push all of the resolved links
 		// into the urls channel.
-		case tt == html.ErrorToken:
-
+		case html.ErrorToken:
 			return
 
-		case tt == html.StartTagToken:
+		case html.SelfClosingTagToken:
 			token := reader.Token()
 
 			switch {
-			case token.Data == "a":
-				u, err := parseAndNormalizeLinkAttribute(&s.URL, &token, "href")
+			case token.Data == "link":
+				if findAttribute(&token, "type") == "text/css" {
+					u, err := findParseAndNormalizeLinkAttribute(&s.URL, &token, "href")
+
+					if err == nil {
+						s.CSS = append(s.CSS, *u)
+					}
+				}
+
+			case token.Data == "img":
+				u, err := findParseAndNormalizeLinkAttribute(&s.URL, &token, "src")
+
+				if err == nil {
+					s.Images = append(s.Images, *u)
+				}
+
+			case token.Data == "source":
+				length := len(openMediaTags)
+
+				if length == 0 {
+					break
+				}
+
+				lastOpenMediaTag := openMediaTags[length-1]
+				u, err := findParseAndNormalizeLinkAttribute(&s.URL, &token, "src")
+
+				if err != nil {
+					break
+				}
+
+				switch lastOpenMediaTag {
+				case "video":
+					s.Videos = append(s.Videos, *u)
+
+				case "audio":
+					s.Audio = append(s.Audio, *u)
+				}
+			}
+
+		case html.StartTagToken:
+			token := reader.Token()
+
+			switch token.Data {
+			case "a":
+				u, err := findParseAndNormalizeLinkAttribute(&s.URL, &token, "href")
 
 				if err != nil {
 					break
@@ -137,25 +142,41 @@ func (s *Site) Crawl() {
 					s.NoFollowLinks = append(s.NoFollowLinks, *u)
 				}
 
-				break
-
-			case token.Data == "script":
-				u, err := parseAndNormalizeLinkAttribute(&s.URL, &token, "src")
+			case "script":
+				u, err := findParseAndNormalizeLinkAttribute(&s.URL, &token, "src")
 
 				if err == nil {
 					s.Scripts = append(s.Scripts, *u)
 				}
 
-				break
+			case "video":
+				openMediaTags = append(openMediaTags, "video")
 
-			case token.Data == "img":
-				u, err := parseAndNormalizeLinkAttribute(&s.URL, &token, "src")
+				u, err := findParseAndNormalizeLinkAttribute(&s.URL, &token, "src")
 
-				if err == nil {
-					s.Images = append(s.Images, *u)
+				var empty url.URL
+
+				if err == nil && *u != empty {
+					s.Videos = append(s.Videos, *u)
 				}
 
-				break
+			case "audio":
+				openMediaTags = append(openMediaTags, "audio")
+
+				u, err := findParseAndNormalizeLinkAttribute(&s.URL, &token, "src")
+
+				var empty url.URL
+
+				if err == nil && *u != empty {
+					s.Audio = append(s.Audio, *u)
+				}
+			}
+
+		case html.EndTagToken:
+			token := reader.Token()
+
+			if token.Data == "video" || token.Data == "audio" {
+				openMediaTags = openMediaTags[:len(openMediaTags)-1]
 			}
 		}
 	}
