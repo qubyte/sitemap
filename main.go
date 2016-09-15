@@ -46,7 +46,7 @@ func main() {
 
 	done := make(chan bool)
 
-	sitemap := NewSiteMap(jobs, originURL)
+	sitemap := NewSiteMap(originURL)
 
 	go sitemap.Crawl(jobs, done)
 
