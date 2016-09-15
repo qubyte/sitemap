@@ -1,3 +1,5 @@
+[![Build Status](https://travis-ci.org/qubyte/sitemap.svg)](https://travis-ci.org/qubyte/sitemap)
+
 # sitemap
 
 sitemap is a library that can crawl a given URL and produce a map of sites
