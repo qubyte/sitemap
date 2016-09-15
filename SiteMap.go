@@ -15,7 +15,7 @@ type SiteMap struct {
 
 // NewSiteMap is a constructor function used to return a SiteMap instance with
 // an initialized sites map.
-func NewSiteMap(workers int, origin *url.URL) *SiteMap {
+func NewSiteMap(origin *url.URL) *SiteMap {
 	return &SiteMap{
 		Sites:  make(map[string]*Site),
 		origin: origin,
